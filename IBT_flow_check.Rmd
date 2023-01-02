@@ -1,0 +1,217 @@
+---
+title: "IBT flow check"
+author: "Ning Liu"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    number_sections: yes
+    toc: yes
+---
+
+This document is used for checking the transferred flow from the IBT dataset using the simulate natural flow from WaSSI model.
+
+# Functions
+```{r}
+# get the net transferred flow for a HUC12 
+f_ibt_net<-function(hru,ibt){
+  
+  # Initialize variables to store water transfer in and out of HUC
+  add=loss=0
+  
+  # Sum all water transfer to this HUC
+  if (sum(ibt$ToHUC12==hru))  add<-sum(ibt$flow_trans[ibt$ToHUC12==hru])
+  
+  # Sum all water transfer out of this HUC
+  if (sum(ibt$FromHUC12==hru)) loss<-sum(ibt$flow_trans[ibt$FromHUC12==hru])
+
+  # Return a list with HUC12 identifier, water transfer in, water transfer out, and net water transfer
+  return(c("HUC12"=hru,"Transfer_in"=add,"Transfer_out"=loss,"IBT_net"=add-loss))
+}
+
+# function for getting the downstream HUC12s of a HUC12
+f_downstreamHUCs<-function(HUCID,routpar){
+
+  # Get the Stream LEVEL of this HUC
+  level_from<-routpar$LEVEL[routpar$FROM==HUCID]
+  donwhucids<-NULL
+
+  # If this HUC has downstream HUCs
+  if (length(level_from)>0){
+
+    # Initialize variables to store downstream HUCs
+    FROM_HUC<-HUCID
+    level_from_from<-level_from
+
+	# Look for downstream HUCs
+    while (length(level_from_from)>0) {
+      # Get downstream HUCs of current HUC
+      TO_HUC<-routpar$TO[routpar$FROM==FROM_HUC]
+
+	  # Append downstream HUCs to list of downstream HUCs
+	  donwhucids<-c(donwhucids,TO_HUC)
+
+	  # Update current HUC to its downstream HUCs
+	  FROM_HUC<-routpar$TO[routpar$FROM==FROM_HUC]
+
+	  # Update the list of downstream HUCs
+      level_from_from<-routpar$LEVEL[routpar$FROM==FROM_HUC]
+    }
+
+    # Return the list of downstream HUCs
+    return(donwhucids)
+  }else{
+    # Return NULL if this HUC has no downstream HUCs
+    return(NULL)
+  }
+
+}
+# function for getting the upstream HUC12s of a HUC12
+f_upstreamHUCs<-function(HUCID,routpar){
+  # The function takes a HUC identifier (HUCID) and a routing parameter dataframe (routpar) as input and returns a list of upstream HUCs
+
+  # Get the Stream LEVEL of this HUC
+  level_to<-routpar$LEVEL[routpar$TO==HUCID]
+
+  # Initialize a list to store upstream HUCs
+  upHUCs<-NULL
+  To<-HUCID
+  # If this HUC has upstream HUCs
+  if(length(level_to)>0){
+
+    # Look for upstream HUCs
+    while (length(level_to)>0){
+      # Get upstream HUCs of current HUC
+      FROM_HUCs<-routpar$FROM[routpar$TO %in% To]
+
+      # Append upstream HUCs to list of upstream HUCs
+      upHUCs<-c(upHUCs,FROM_HUCs)
+
+      # Update current HUC to its upstream HUCs
+      To<-routpar$FROM[routpar$TO %in% To]
+
+      # Update the list of upstream HUCs
+      level_to<-routpar$LEVEL[routpar$TO %in% To]
+
+    }
+
+    # Return the list of upstream HUCs
+    return(upHUCs)
+  }else{
+    # Return NULL if this HUC has no upstream HUCs
+    return(NULL)
+  }
+
+}
+
+# Function for sorting IBT transfers
+f_sort_IBT <- function(ibt) {
+  
+  # This function sorts the input table 'ibt' by the column 'WRR_FROM' and 'StepID'
+  # and adds an 'Order' column with row numbers
+  ibt %>%
+    mutate(WRR_FROM = factor(WRR_FROM, levels = c(14, 15, 16, 18, 11, 1:10, 12, 13, 17))) %>%
+    arrange(WRR_FROM, StepID) %>%
+    mutate(Order = row_number())
+}
+
+```
+
+# Check negative IBTs using simulated available water from 2001 to 2015
+
+```{r}
+library(dplyr)
+# load IBT transfer data
+load("IBT_all_2022_04_25.RData")
+ibt_all<-ibt_all %>% 
+  mutate(TransMm3=Y2015Mm3) %>% # test the transferred flow in 2015 
+  filter(TransMm3>0) %>% 
+  f_sort_IBT()
+
+# Load HUC12 information and the flow direction
+load("HUC12_info_WBD2017.RData")
+load("routpar.RData")
+
+# Read flow data
+flow<-read.csv("CONUS_acFlw_01_15.csv")
+
+Reservoir_HUCs<-unique(c(ibt_all$FromHUC12[ibt_all$Reservoir %in% c("From","Both")],ibt_all$ToHUC12[ibt_all$Reservoir %in% c("TO","Both")]))
+
+# calculate the net water transfer for IBT HUCs ignoring the transfer direction
+ibt<-ibt_all%>%
+	mutate(flow_trans=TransMm3)%>%
+	filter(flow_trans>0)
+
+# get all HUCs involoved in IBTs
+HUCs_ibt<-unique(c(ibt$FromHUC12,ibt$ToHUC12))
+
+# Get the net transfered water for those HUCs
+list_nets<-lapply(HUCs_ibt, f_ibt_net,ibt=ibt)
+
+# List to dataframe and add HUCinfor ("HUC_ID","HUC12","WRR").
+HUC_ibt_net<-as.data.frame(do.call(rbind,list_nets))%>%
+	mutate(Transfer_in=round(as.numeric(as.character(Transfer_in)),2),
+	Transfer_out=round(as.numeric(as.character(Transfer_out)),2),
+	IBT_net=round(as.numeric(as.character(IBT_net)),2))%>%
+	mutate(HUC12=as.character(HUC12))%>%
+	merge(HUC_info[,c("HUC_ID","HUC12","WRR")],by="HUC12",all.x = T)%>%
+	dplyr:: select("HUC_ID","HUC12","WRR", "Transfer_in","Transfer_out" ,"IBT_net" )
+
+summary(HUC_ibt_net$IBT_net)
+
+# Merge net transfer to flow and get the difference between flow demand (IBT_dif)
+water_test<-merge(flow,HUC_ibt_net,by="HUC_ID",all.y=T)%>%
+	mutate(IBT_dif=acFlw+IBT_net)%>%
+	mutate(flow=acFlw)
+
+# temp ibt    
+ibt_test<-ibt%>%
+	dplyr::select(TransferID,StepID,FromHUC12,ToHUC12,HUC_ID_F,HUC_ID_T,flow_trans,Reservoir,Order)%>%
+	filter(!is.na(flow_trans))
+
+# Run each IBT to update flow for each HUC within IBT table   
+for(id in c(1:length(ibt_test$FromHUC12))){
+      
+	hru_from<-ibt_test$HUC_ID_F[id]
+	hru_to<-ibt_test$HUC_ID_T[id]
+	# print(paste0(id," Update flow of FromHUC12 = ",hru_from," and TOHUC12= ",hru_to))
+      
+	# transfer water from FROM HUC to TO HUC 
+	water_test$flow[water_test$HUC_ID==hru_from]<-water_test$flow[water_test$HUC_ID==hru_from]-ibt_test$flow_trans[id]
+	water_test$flow[water_test$HUC_ID==hru_to]<-water_test$flow[water_test$HUC_ID==hru_to]+ibt_test$flow_trans[id]
+    
+	# Update the water for downstream of FROM HUC
+	downhurids_from<-f_downstreamHUCs(hru_from,routpar = routpar)
+	updatefromids<-which(water_test$HUC_ID %in% downhurids_from)
+	water_test$flow[updatefromids]<-water_test$flow[updatefromids]-ibt_test$flow_trans[id]
+	
+	# Update the water for downstream of TO HUC
+	downhurids_to<-f_downstreamHUCs(hru_to,routpar = routpar)
+	updatetoids<-which(water_test$HUC_ID %in% downhurids_to)
+	water_test$flow[updatetoids]<-water_test$flow[updatetoids]+ibt_test$flow_trans[id]
+      
+}
+
+# Get the HUC with negative flow after applying all IBTs    
+test_HUCids<-unique(water_test$HUC_ID[water_test$flow<0])
+
+# Get the upstream HUCs of them
+for(hurid in test_HUCids){
+	test_HUCids<-c(test_HUCids,f_upstreamHUCs(hurid,routpar = routpar))
+}
+
+# Get the IBTs in the upstream of these negative HUCs    
+ibt_test<-ibt_test%>%
+	filter(FromHUC12 %in% HUC_info$HUC12[HUC_info$HUC_ID %in% test_HUCids])
+
+# Merge reservoir to the IBT table      
+ibt_test_flow<-water_test%>%
+	filter(HUC12 %in% ibt_test$FromHUC12)%>%
+	dplyr::rename(IBT_in=Transfer_in,IBT_out=Transfer_out,acFlw_pre=acFlw,acFlw_post=flow)%>%
+	filter(acFlw_post<0 & IBT_dif<0)%>%
+	mutate(Reservoir= HUC12 %in% Reservoir_HUCs)%>%
+	dplyr::select(HUC_ID,HUC12,WRR,IBT_in,IBT_out,IBT_net,IBT_dif,acFlw_pre,acFlw_post,Reservoir)
+
+# Write the final tested result
+write.csv(ibt_test_flow, "IBT_Flow_test_all.csv")   
+  
+```
